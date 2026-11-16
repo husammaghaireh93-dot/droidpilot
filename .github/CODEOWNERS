@@ -1,0 +1,8 @@
+# Mandatory review ownership for all security-sensitive paths and repository files.
+# Enable Branch Protection on GitHub (Settings -> Branches -> Require review from Code Owners).
+* @husammaghaireh93-dot
+/android/app/src/main/kotlin/com/mobilemcp/pro/security/ @husammaghaireh93-dot
+/android/app/src/main/kotlin/com/mobilemcp/pro/service/ @husammaghaireh93-dot
+/android/app/src/main/kotlin/com/mobilemcp/pro/server/ @husammaghaireh93-dot
+/android/app/src/main/AndroidManifest.xml @husammaghaireh93-dot
+/.github/ @husammaghaireh93-dot
