@@ -1,4 +1,4 @@
-# DroidPilot Hardening Verification & Security Test Plan (Slice 1 + Slice 2)
+# DroidPilot Hardening Verification & Security Test Plan (Slice 1 + Slice 2 + Slice 3)
 
 ## 1. Strict Preconditions (Mandatory Before Any On-Device Test)
 1. **Wireless Debugging (`ADB` over Wi-Fi) MUST be OFF** in Developer Options.
@@ -83,3 +83,31 @@ Executed via `./gradlew testDebugUnitTest` inside `android/`:
 - **T8 (`TIER_0_HARD_DENY` Financial & Settings)**: Open `com.reflect`, `com.umniah.uwallet`, or `com.android.settings` -> `get_ui_tree`, `click_element`, and `type_text` are all immediately denied (`TIER_0_HARD_DENY`).
 - **T9 (`TIER_1_READ_ONLY` Clock / Calendar)**: Open Clock (`com.google.android.deskclock` / `com.hihonor.deskclock`) -> `get_ui_tree` succeeds with `NodeSanitizer`; `click_element` and `type_text` are immediately denied without showing a consent prompt.
 - **T10 (`ConsentRateLimiter` Flood & Cooldown)**: Trigger 3 consecutive consent denials/timeouts in Calculator -> 4th `click_element` immediately returns cooldown error without prompting; `audit_chain.jsonl` records `cooldown_activated_60s`; after 60s, prompts resume normally. Trigger 5 rapid prompts within 1 minute -> 6th prompt is rate-limited until the sliding window advances.
+
+---
+
+## 5. Slice 3 Automated & Manual Scenarios (Dynamic Policy Store, Audit Bundle Export & Release Hardening)
+
+### Automated JVM Tests Added in `SecurityPolicyTest`
+- **`DynamicPolicyStore` Encryption & Live Enforcement**:
+  - Persists dynamic `TIER_1_READ_ONLY` and `TIER_2_CONSENT_GATED` assignments via AES/GCM/NoPadding (`InMemoryEncryptedPolicyVault` in JVM tests, `AndroidKeystorePolicyVault` on Android).
+  - Applies updates immediately in `PolicyEngine` without restarting `MobileAccessibilityService` and restores them cleanly on reload.
+  - Rejects any attempt to add `TIER_0_HARD_DENY` packages (including `com.reflect`, `com.umniah.uwallet`, `com.android.settings`, `com.x8bit.bitwarden`, `com.android.packageinstaller`, `com.mobilemcp.pro`) and strips them even if storage payload is tampered.
+- **`AuditLogger` Bundle Export & Independent Verifier**:
+  - `exportSignedAuditBundle` outputs JSON containing `entries` (`prevHash` / `hash`), top-level & `summary` metadata (`chainValid`, `entryCount`, `firstHash`, `lastHash`, `exportedAtEpochMs`), and `bundleDigestSha256`.
+  - `verifyExportedBundle` / `verifyExportedBundleDetailed` validates untampered bundles and rejects any status modification, metadata/timestamp edit, or entry deletion.
+- **Release R8/ProGuard Build Verification (CI)**:
+  - CI runs `./gradlew assembleRelease` with `isMinifyEnabled = true` and `isShrinkResources = true` against `proguard-rules.pro`.
+
+### Manual Slice 3 Verification Scenarios (`T11–T14`)
+- **T11 (Immediate Auth Token Rotation via UI)**:
+  - Connect a WebSocket client using the active token.
+  - Tap **`Rotate Auth Token`** in `MainActivity` -> active WebSocket disconnects immediately with close code `4001` (`Unauthorized: Auth token rotated`), token is never rendered/logged in plaintext, and reconnecting with the old token fails with `4001`.
+- **T12 (Dynamic Policy Management & `TIER_0_HARD_DENY` Guard)**:
+  - Enter `com.reflect` or `com.android.settings` in the Dynamic Package Tiers field and tap **`Add TIER_1 (Read-Only)`** or **`Add TIER_2 (Consent)`** -> immediately rejected with `TIER_0_HARD_DENY` error message.
+  - Enter an allowed non-financial package (e.g. `com.example.notes`), tap **`Add TIER_2 (Consent)`**, and verify it is enforced live without restarting Accessibility Service, then tap **`Remove Package`** to revert to default-deny.
+- **T13 (Tamper-Evident Audit Bundle Export via SAF)**:
+  - Tap **`Export Audit Log (JSON)`** -> Android Storage Access Framework (`ACTION_CREATE_DOCUMENT`) saves `droidpilot-audit-bundle.json` without external storage permissions.
+  - Verify `chainValid: true` and `entryCount` matches; modify one character in the exported file and confirm `AuditLogger.verifyExportedBundle` rejects it.
+- **T14 (Production Release Build Verification)**:
+  - Confirm GitHub Actions CI passes `testDebugUnitTest`, `assembleDebug`, and `assembleRelease` (R8 minification + resource shrinking) and verifies SHA-256 checksums for both artifacts.

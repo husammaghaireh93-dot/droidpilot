@@ -43,7 +43,7 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Verify APK SHA-256 Checksum
+      - name: Verify Debug APK SHA-256 Checksum
         run: |
           APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK_PATH"
@@ -62,6 +62,31 @@ jobs:
           path: |
             android/app/build/outputs/apk/debug/app-debug.apk
             android/app/build/outputs/apk/debug/app-debug.apk.sha256
+          if-no-files-found: error
+
+      - name: Build Unsigned Release APK (R8/ProGuard Verification)
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Verify Unsigned Release APK SHA-256 Checksum
+        run: |
+          RELEASE_APK=$(find android/app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n 1)
+          test -f "$RELEASE_APK"
+          sha256sum "$RELEASE_APK" | tee "${RELEASE_APK}.sha256"
+          {
+            echo "### Unsigned Release APK SHA-256"
+            echo '```'
+            cat "${RELEASE_APK}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Unsigned Release APK and SHA-256
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: droidpilot-hardened-release-unsigned-apk
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/release/*.apk.sha256
           if-no-files-found: error
 
   mcp-server-build:

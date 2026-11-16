@@ -38,6 +38,25 @@ class PolicyEngine(
     private val effectiveReadOnlyPackages: Set<String> =
         readOnlyPackages.filterNot { isHardDeniedPackage(it) || it in effectiveConsentGatedPackages }.toSet()
 
+    @Volatile
+    private var dynamicReadOnlyPackages: Set<String> = emptySet()
+
+    @Volatile
+    private var dynamicConsentGatedPackages: Set<String> = emptySet()
+
+    fun updateDynamicPackages(readOnly: Set<String>, consentGated: Set<String>) {
+        val cleanConsent = consentGated
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !isHardDeniedPackage(it) }
+            .toSet()
+        val cleanReadOnly = readOnly
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !isHardDeniedPackage(it) && it !in cleanConsent }
+            .toSet()
+        dynamicConsentGatedPackages = cleanConsent
+        dynamicReadOnlyPackages = cleanReadOnly
+    }
+
     companion object {
         val ALLOWED_READ_COMMANDS = setOf("get_ui_tree")
         val ALLOWED_MUTATION_COMMANDS = setOf("click_element", "type_text")
@@ -198,9 +217,11 @@ class PolicyEngine(
             return PackageTier.TIER_0_HARD_DENY
         }
         val normalized = packageName.trim()
-        return when (normalized) {
-            in effectiveConsentGatedPackages -> PackageTier.TIER_2_CONSENT_GATED
-            in effectiveReadOnlyPackages -> PackageTier.TIER_1_READ_ONLY
+        return when {
+            normalized in dynamicConsentGatedPackages -> PackageTier.TIER_2_CONSENT_GATED
+            normalized in dynamicReadOnlyPackages -> PackageTier.TIER_1_READ_ONLY
+            normalized in effectiveConsentGatedPackages -> PackageTier.TIER_2_CONSENT_GATED
+            normalized in effectiveReadOnlyPackages -> PackageTier.TIER_1_READ_ONLY
             else -> PackageTier.TIER_0_HARD_DENY
         }
     }
