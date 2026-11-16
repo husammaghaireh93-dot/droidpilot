@@ -299,21 +299,20 @@ class SecurityPolicyTest {
         val firstConnectedLatch = CountDownLatch(1)
         val secondConnectedLatch = CountDownLatch(1)
         val rotated = AtomicInteger(0)
-        val server = object : WebSocketCommandServer(
+        val server = WebSocketCommandServer(
             port = port,
-            onLog = {},
+            onLog = { msg ->
+                if (msg.startsWith("Server started on")) {
+                    startedLatch.countDown()
+                }
+            },
             onConnectionChange = { count ->
                 connCount.set(count)
                 if (count == 1) {
                     if (rotated.get() == 0) firstConnectedLatch.countDown() else secondConnectedLatch.countDown()
                 }
             }
-        ) {
-            override fun onStart() {
-                super.onStart()
-                startedLatch.countDown()
-            }
-        }
+        )
         server.authToken = "initial-token-alpha"
         server.start()
 
