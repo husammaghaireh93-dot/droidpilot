@@ -25,6 +25,7 @@ import com.mobilemcp.pro.model.CommandRequest
 import com.mobilemcp.pro.model.CommandResponse
 import com.mobilemcp.pro.model.UINode
 import com.mobilemcp.pro.security.ConsentCoordinator
+import com.mobilemcp.pro.security.DynamicPolicyStore
 import com.mobilemcp.pro.security.NodeSanitizer
 import com.mobilemcp.pro.security.PolicyDecisionType
 import com.mobilemcp.pro.security.PolicyEngine
@@ -48,6 +49,9 @@ class MobileAccessibilityService : AccessibilityService() {
     private val gson = Gson()
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val policyEngine = PolicyEngine()
+    private val dynamicPolicyStore: DynamicPolicyStore by lazy {
+        DynamicPolicyStore.createAndroid(applicationContext, policyEngine)
+    }
     private val auditLogger: AuditLogger by lazy { AuditLogger(filesDir) }
     private val consentCoordinator: ConsentCoordinator by lazy {
         ConsentCoordinator(
@@ -67,8 +71,17 @@ class MobileAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         isRunning = true
+        dynamicPolicyStore.reload()
         ensureConsentNotificationChannel()
         Log.i(TAG, "Accessibility service connected")
+    }
+
+    fun reloadDynamicPolicies() {
+        dynamicPolicyStore.reload()
+    }
+
+    fun exportAuditBundleJson(): String {
+        return auditLogger.exportSignedAuditBundle()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
