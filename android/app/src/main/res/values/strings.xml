@@ -15,4 +15,11 @@
     <string name="notification_channel_description">Shows when MCP server is running</string>
     <string name="notification_title">Mobile MCP Pro is running</string>
     <string name="notification_text">WebSocket server active on port %d</string>
+    <string name="btn_rotate_token">Rotate Auth Token</string>
+    <string name="btn_export_audit">Export Audit Log (JSON)</string>
+    <string name="label_dynamic_policies">Dynamic Package Tiers (Encrypted)</string>
+    <string name="hint_policy_package">com.example.app</string>
+    <string name="btn_add_tier1">Add TIER_1 (Read-Only)</string>
+    <string name="btn_add_tier2">Add TIER_2 (Consent)</string>
+    <string name="btn_remove_policy">Remove Package</string>
 </resources>

@@ -240,6 +240,126 @@
             android:textSize="16sp"
             app:cornerRadius="16dp" />
 
+        <!-- Security Actions: Rotate Token & Export Audit -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnRotateToken"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:text="@string/btn_rotate_token"
+                android:textColor="@color/text_primary"
+                app:cornerRadius="12dp"
+                app:strokeColor="@color/primary" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnExportAudit"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:text="@string/btn_export_audit"
+                android:textColor="@color/text_primary"
+                app:cornerRadius="12dp"
+                app:strokeColor="@color/primary" />
+        </LinearLayout>
+
+        <!-- Dynamic Policy Management Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            app:cardBackgroundColor="@color/surface_card"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/label_dynamic_policies"
+                    android:textAllCaps="true"
+                    android:letterSpacing="0.08"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/etPolicyPackage"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/edit_text_bg"
+                    android:fontFamily="monospace"
+                    android:hint="@string/hint_policy_package"
+                    android:inputType="textNoSuggestions"
+                    android:paddingHorizontal="12dp"
+                    android:textColor="@color/text_primary"
+                    android:textColorHint="@color/text_secondary"
+                    android:textSize="14sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnAddTier1"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp"
+                        android:layout_weight="1"
+                        android:text="@string/btn_add_tier1"
+                        android:textSize="12sp"
+                        app:cornerRadius="12dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnAddTier2"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="6dp"
+                        android:layout_weight="1"
+                        android:text="@string/btn_add_tier2"
+                        android:textSize="12sp"
+                        app:cornerRadius="12dp" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRemovePolicy"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/btn_remove_policy"
+                    android:textColor="@color/status_disconnected" />
+
+                <TextView
+                    android:id="@+id/tvPolicyStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Log -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"

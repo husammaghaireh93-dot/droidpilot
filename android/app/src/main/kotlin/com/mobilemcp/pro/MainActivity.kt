@@ -19,8 +19,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.mobilemcp.pro.databinding.ActivityMainBinding
+import com.mobilemcp.pro.security.DynamicPolicyStore
 import com.mobilemcp.pro.security.KeyStoreManager
+import com.mobilemcp.pro.security.PackageTier
+import com.mobilemcp.pro.security.PolicyUpdateResult
 import com.mobilemcp.pro.server.WebSocketCommandServer
+import com.mobilemcp.pro.service.AuditLogger
 import com.mobilemcp.pro.service.ConnectionForegroundService
 import com.mobilemcp.pro.service.MobileAccessibilityService
 import java.text.SimpleDateFormat
@@ -33,6 +37,35 @@ class MainActivity : AppCompatActivity() {
     private var isServerRunning = false
     private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     private val keyStoreManager: KeyStoreManager by lazy { KeyStoreManager(applicationContext) }
+    private val dynamicPolicyStore: DynamicPolicyStore by lazy { DynamicPolicyStore.createAndroid(applicationContext) }
+    private val auditLogger: AuditLogger by lazy { AuditLogger(applicationContext.filesDir) }
+
+    private val createAuditExportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) {
+            appendLog("Audit export cancelled.")
+            return@registerForActivityResult
+        }
+        try {
+            val bundleJson = MobileAccessibilityService.instance?.exportAuditBundleJson()
+                ?: auditLogger.exportSignedAuditBundle()
+            contentResolver.openOutputStream(uri)?.use { stream ->
+                stream.write(bundleJson.toByteArray(Charsets.UTF_8))
+            } ?: throw IllegalStateException("Unable to open destination document stream")
+
+            val verification = AuditLogger.verifyExportedBundleDetailed(bundleJson)
+            appendLog("Audit bundle exported (${verification.entryCount} entries, verified=${verification.valid}).")
+            Toast.makeText(
+                this,
+                "Audit exported (${verification.entryCount} entries, valid=${verification.valid})",
+                Toast.LENGTH_SHORT
+            ).show()
+        } catch (e: Exception) {
+            appendLog("Audit export failed: ${e.message}")
+            Toast.makeText(this, "Audit export failed", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     private val requestNotificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -83,7 +116,88 @@ class MainActivity : AppCompatActivity() {
             copyAuthTokenSafely()
         }
 
+        binding.btnRotateToken.setOnClickListener {
+            rotateAuthTokenSafely()
+        }
+
+        binding.btnExportAudit.setOnClickListener {
+            createAuditExportLauncher.launch("droidpilot-audit-bundle.json")
+        }
+
+        binding.btnAddTier1.setOnClickListener {
+            handleAddDynamicPolicy(PackageTier.TIER_1_READ_ONLY)
+        }
+
+        binding.btnAddTier2.setOnClickListener {
+            handleAddDynamicPolicy(PackageTier.TIER_2_CONSENT_GATED)
+        }
+
+        binding.btnRemovePolicy.setOnClickListener {
+            handleRemoveDynamicPolicy()
+        }
+
         updateIPAddress()
+        refreshPolicyStatusDisplay()
+    }
+
+    private fun rotateAuthTokenSafely() {
+        try {
+            val newToken = keyStoreManager.rotateAuthToken()
+            wsServer?.rotateAuthToken(newToken)
+            appendLog("Auth token rotated safely; all active WebSocket sessions disconnected (4001).")
+            Toast.makeText(this, "Auth token rotated (sessions closed)", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            appendLog("Failed to rotate auth token: ${e.message}")
+        }
+    }
+
+    private fun handleAddDynamicPolicy(tier: PackageTier) {
+        val pkg = binding.etPolicyPackage.text?.toString()?.trim().orEmpty()
+        when (val result = dynamicPolicyStore.addPackage(pkg, tier)) {
+            is PolicyUpdateResult.Success -> {
+                MobileAccessibilityService.instance?.reloadDynamicPolicies()
+                binding.etPolicyPackage.setText("")
+                val msg = "Added ${result.packageName} -> ${result.tier}"
+                refreshPolicyStatusDisplay(msg)
+                appendLog(msg)
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            }
+            is PolicyUpdateResult.Rejected -> {
+                refreshPolicyStatusDisplay("DENIED: ${result.reason}")
+                appendLog("POLICY REJECTED: ${result.reason}")
+                Toast.makeText(this, result.reason, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun handleRemoveDynamicPolicy() {
+        val pkg = binding.etPolicyPackage.text?.toString()?.trim().orEmpty()
+        if (pkg.isEmpty()) {
+            refreshPolicyStatusDisplay("Enter a package name to remove.")
+            return
+        }
+        val removed = dynamicPolicyStore.removePackage(pkg)
+        MobileAccessibilityService.instance?.reloadDynamicPolicies()
+        val msg = if (removed) {
+            binding.etPolicyPackage.setText("")
+            "Removed $pkg from dynamic tiers."
+        } else {
+            "Package $pkg not present in dynamic tiers."
+        }
+        refreshPolicyStatusDisplay(msg)
+        appendLog(msg)
+    }
+
+    private fun refreshPolicyStatusDisplay(feedback: String? = null) {
+        val t1 = dynamicPolicyStore.getReadOnlyPackages().sorted()
+        val t2 = dynamicPolicyStore.getConsentGatedPackages().sorted()
+        val sb = StringBuilder()
+        if (!feedback.isNullOrBlank()) {
+            sb.append(feedback).append('\n')
+        }
+        sb.append("TIER_1 (Read-Only): ").append(if (t1.isEmpty()) "none" else t1.joinToString(", ")).append('\n')
+        sb.append("TIER_2 (Consent-Gated): ").append(if (t2.isEmpty()) "none" else t2.joinToString(", "))
+        binding.tvPolicyStatus.text = sb.toString()
     }
 
     private fun copyAuthTokenSafely() {
