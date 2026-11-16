@@ -1,20 +1,33 @@
 package com.mobilemcp.pro.service
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.os.Build
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.mobilemcp.pro.model.CommandRequest
 import com.mobilemcp.pro.model.CommandResponse
 import com.mobilemcp.pro.model.UINode
+import com.mobilemcp.pro.security.ConsentCoordinator
+import com.mobilemcp.pro.security.NodeSanitizer
+import com.mobilemcp.pro.security.PolicyDecisionType
+import com.mobilemcp.pro.security.PolicyEngine
 import com.mobilemcp.pro.server.WebSocketCommandServer
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -25,6 +38,7 @@ class MobileAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "MobileAccessibility"
+        private const val CONSENT_CHANNEL_ID = "droidpilot_consent_channel"
         var instance: MobileAccessibilityService? = null
             private set
         var isRunning = false
@@ -33,11 +47,15 @@ class MobileAccessibilityService : AccessibilityService() {
 
     private val gson = Gson()
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val policyEngine = PolicyEngine()
+    private val consentCoordinator = ConsentCoordinator()
+    private val auditLogger: AuditLogger by lazy { AuditLogger(filesDir) }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         isRunning = true
+        ensureConsentNotificationChannel()
         Log.i(TAG, "Accessibility service connected")
     }
 
@@ -51,34 +69,164 @@ class MobileAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        consentCoordinator.cancelActive()
         instance = null
         isRunning = false
         serviceScope.cancel()
         Log.i(TAG, "Accessibility service destroyed")
     }
 
+    fun resolveConsent(nonce: String?, approved: Boolean) {
+        consentCoordinator.submitDecision(nonce, approved)
+    }
+
+    private fun ensureConsentNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CONSENT_CHANNEL_ID,
+                "Action Approval Requests",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Requires explicit user confirmation before executing UI actions"
+            }
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun areNotificationsEnabled(): Boolean {
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+            return false
+        }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    /**
+     * Requests explicit user approval via a high-priority notification backed by an internal
+     * (non-exported) BroadcastReceiver and a single-use 128-bit cryptographic nonce.
+     * Note: WebSocketCommandServer invokes handleCommand on its background worker pool,
+     * never blocking the Android Main thread where ConsentReceiver.onReceive runs.
+     */
+    private fun requestUserConsent(
+        action: String,
+        targetPackage: String,
+        targetElement: String,
+        description: String
+    ): Pair<Boolean, String> {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            val reason = "Refusing to block Main thread for interactive consent."
+            auditLogger.record(action, targetPackage, targetElement, "denied", reason)
+            return Pair(false, reason)
+        }
+
+        val startResult = consentCoordinator.startConsent(areNotificationsEnabled())
+        if (startResult is ConsentCoordinator.StartResult.Denied) {
+            auditLogger.record(action, targetPackage, targetElement, "denied", startResult.reason)
+            return Pair(false, startResult.reason)
+        }
+
+        val session = (startResult as ConsentCoordinator.StartResult.Started).session
+        val notificationId = session.nonce.hashCode()
+
+        val approveIntent = Intent(this, ConsentReceiver::class.java).apply {
+            this.action = ConsentReceiver.ACTION_CONSENT_DECISION
+            setPackage(packageName)
+            putExtra(ConsentReceiver.EXTRA_NONCE, session.nonce)
+            putExtra(ConsentReceiver.EXTRA_APPROVED, true)
+        }
+        val denyIntent = Intent(this, ConsentReceiver::class.java).apply {
+            this.action = ConsentReceiver.ACTION_CONSENT_DECISION
+            setPackage(packageName)
+            putExtra(ConsentReceiver.EXTRA_NONCE, session.nonce)
+            putExtra(ConsentReceiver.EXTRA_APPROVED, false)
+        }
+
+        val approvePending = PendingIntent.getBroadcast(
+            this,
+            notificationId * 31 + 1,
+            approveIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val denyPending = PendingIntent.getBroadcast(
+            this,
+            notificationId * 31 + 2,
+            denyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, CONSENT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("Approve agent action?")
+            .setContentText(description)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(description))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setTimeoutAfter(ConsentCoordinator.DEFAULT_TIMEOUT_MS)
+            .setDeleteIntent(denyPending)
+            .addAction(0, "Approve", approvePending)
+            .addAction(0, "Deny", denyPending)
+            .build()
+
+        NotificationManagerCompat.from(this).notify(notificationId, notification)
+
+        val approved = try {
+            consentCoordinator.awaitResult(session)
+        } finally {
+            NotificationManagerCompat.from(this).cancel(notificationId)
+        }
+
+        return if (approved) {
+            Pair(true, "approved")
+        } else {
+            val reason = "User denied or consent timed out (default-deny)."
+            auditLogger.record(action, targetPackage, targetElement, "denied_or_timeout", reason)
+            Pair(false, reason)
+        }
+    }
+
+    /**
+     * Dispatches incoming WebSocket commands through strict PolicyEngine default-deny allowlist.
+     * Executed on WebSocketCommandServer's worker thread pool (Executors.newFixedThreadPool(4)).
+     */
     fun handleCommand(request: CommandRequest): CommandResponse {
         return try {
+            val root = rootInActiveWindow
+            val currentPackage = root?.packageName?.toString()
+            root?.recycle()
+
+            val decision = policyEngine.evaluate(request.command, currentPackage)
+            if (decision.type == PolicyDecisionType.DENY) {
+                auditLogger.record(
+                    action = request.command ?: "unknown",
+                    targetPackage = currentPackage ?: "none",
+                    targetElement = null,
+                    consent = "n/a",
+                    status = "denied: ${decision.reason}"
+                )
+                return CommandResponse.error(request.id, decision.reason)
+            }
+
             when (request.command) {
-                "tap" -> executeTap(request.params)
-                "long_press" -> executeLongPress(request.params)
-                "swipe" -> executeSwipe(request.params)
-                "type_text" -> executeTypeText(request.params)
-                "set_text" -> executeSetText(request.params)
-                "press_key" -> executePressKey(request.params)
-                "get_ui_tree" -> executeGetUITree(request.params)
-                "find_element" -> executeFindElement(request.params)
-                "screenshot" -> executeScreenshot(request.params)
-                "wait_for_element" -> executeWaitForElement(request.params)
-                "open_app" -> executeOpenApp(request.params)
-                "get_device_info" -> executeGetDeviceInfo()
-                "scroll" -> executeScroll(request.params)
-                "pinch" -> executePinch(request.params)
-                "click_element" -> executeClickElement(request.params)
-                "get_focused" -> executeGetFocused()
-                "notifications" -> executeGetNotifications()
-                "ping" -> CommandResponse.success(request.id, JsonObject().apply { addProperty("pong", true) })
-                else -> CommandResponse.error(request.id, "Unknown command: ${request.command}")
+                "get_ui_tree" -> executeGetUITree(request.params, currentPackage!!)
+                "click_element" -> executeClickElement(request.params, currentPackage!!)
+                "type_text" -> executeTypeText(request.params, currentPackage!!)
+                else -> {
+                    val reason = "Command '${request.command}' denied by default-deny policy."
+                    auditLogger.record(
+                        action = request.command ?: "unknown",
+                        targetPackage = currentPackage ?: "none",
+                        targetElement = null,
+                        consent = "n/a",
+                        status = "denied: $reason"
+                    )
+                    CommandResponse.error(request.id, reason)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling command ${request.command}", e)
@@ -207,10 +355,64 @@ class MobileAccessibilityService : AccessibilityService() {
 
     // --- Text Commands ---
 
-    private fun executeTypeText(params: JsonObject?): CommandResponse {
+    private fun executeTypeText(params: JsonObject?, currentPackage: String): CommandResponse {
         val text = params?.get("text")?.asString ?: return CommandResponse.error(null, "Missing text")
-        val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        val preFocused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?: return CommandResponse.error(null, "No focused input field")
+
+        val preIsPassword = preFocused.isPassword
+        val prePkg = preFocused.packageName?.toString()
+        val preRefreshed = preFocused.refresh()
+        preFocused.recycle()
+
+        if (preIsPassword) {
+            auditLogger.record("type_text", currentPackage, "password_field", "n/a", "denied: password field protected")
+            return CommandResponse.error(null, "Typing into password fields is blocked")
+        }
+        val prePkgCheck = policyEngine.verifyTargetNodePackage(prePkg, preRefreshed)
+        if (prePkgCheck.type == PolicyDecisionType.DENY) {
+            auditLogger.record("type_text", prePkg ?: currentPackage, "focused_input", "n/a", "denied: ${prePkgCheck.reason}")
+            return CommandResponse.error(null, prePkgCheck.reason)
+        }
+
+        val (approved, consentReason) = requestUserConsent(
+            action = "type_text",
+            targetPackage = currentPackage,
+            targetElement = "focused_input(${text.length} chars)",
+            description = "Type ${text.length} char(s) into focused field in $currentPackage"
+        )
+        if (!approved) {
+            return CommandResponse.error(null, consentReason)
+        }
+
+        // Re-check active foreground window package AFTER consent approval and BEFORE execution
+        val postRoot = rootInActiveWindow ?: run {
+            auditLogger.record("type_text", currentPackage, "focused_input", "approved", "denied: no active window after consent")
+            return CommandResponse.error(null, "No active window after consent")
+        }
+        val postPackage = postRoot.packageName?.toString()
+        postRoot.recycle()
+
+        val postDecision = policyEngine.evaluate("type_text", postPackage)
+        if (postDecision.type == PolicyDecisionType.DENY) {
+            auditLogger.record("type_text", postPackage ?: "none", "focused_input", "approved", "denied: ${postDecision.reason}")
+            return CommandResponse.error(null, postDecision.reason)
+        }
+
+        val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: run {
+            auditLogger.record("type_text", postPackage!!, "focused_input", "approved", "denied: no focused input after consent")
+            return CommandResponse.error(null, "No focused input field")
+        }
+
+        val refreshed = focused.refresh()
+        val targetPackage = focused.packageName?.toString()
+        val targetCheck = policyEngine.verifyTargetNodePackage(targetPackage, refreshed)
+        if (targetCheck.type == PolicyDecisionType.DENY || focused.isPassword) {
+            focused.recycle()
+            val reason = if (focused.isPassword) "Typing into password fields is blocked" else targetCheck.reason
+            auditLogger.record("type_text", targetPackage ?: postPackage!!, "focused_input", "approved", "denied: $reason")
+            return CommandResponse.error(null, reason)
+        }
 
         val args = android.os.Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
@@ -220,8 +422,10 @@ class MobileAccessibilityService : AccessibilityService() {
         focused.recycle()
 
         return if (result) {
-            CommandResponse.success(null, JsonObject().apply { addProperty("typed", text) })
+            auditLogger.record("type_text", targetPackage!!, "focused_input(${text.length} chars)", "approved", "executed")
+            CommandResponse.success(null, JsonObject().apply { addProperty("typed_length", text.length) })
         } else {
+            auditLogger.record("type_text", targetPackage!!, "focused_input(${text.length} chars)", "approved", "failed")
             CommandResponse.error(null, "Failed to type text")
         }
     }
@@ -273,13 +477,23 @@ class MobileAccessibilityService : AccessibilityService() {
 
     // --- UI Tree Commands ---
 
-    private fun executeGetUITree(params: JsonObject?): CommandResponse {
+    private fun executeGetUITree(params: JsonObject?, currentPackage: String): CommandResponse {
         val maxDepth = params?.get("maxDepth")?.asInt ?: 15
         val root = rootInActiveWindow ?: return CommandResponse.error(null, "No active window")
+
+        val refreshed = root.refresh()
+        val rootPkg = root.packageName?.toString()
+        val pkgCheck = policyEngine.verifyTargetNodePackage(rootPkg, refreshed)
+        if (pkgCheck.type == PolicyDecisionType.DENY) {
+            root.recycle()
+            auditLogger.record("get_ui_tree", rootPkg ?: currentPackage, null, "not_required", "denied: ${pkgCheck.reason}")
+            return CommandResponse.error(null, pkgCheck.reason)
+        }
 
         val tree = buildUITree(root, 0, maxDepth)
         root.recycle()
 
+        auditLogger.record("get_ui_tree", rootPkg!!, null, "not_required", "executed")
         val json = gson.toJsonTree(tree)
         return CommandResponse.success(null, JsonObject().apply { add("tree", json) })
     }
@@ -304,20 +518,82 @@ class MobileAccessibilityService : AccessibilityService() {
         })
     }
 
-    private fun executeClickElement(params: JsonObject?): CommandResponse {
-        val root = rootInActiveWindow ?: return CommandResponse.error(null, "No active window")
+    private fun executeClickElement(params: JsonObject?, currentPackage: String): CommandResponse {
+        val preRoot = rootInActiveWindow ?: return CommandResponse.error(null, "No active window")
 
         val text = params?.get("text")?.asString
         val id = params?.get("id")?.asString
         val contentDesc = params?.get("contentDescription")?.asString
 
-        val node = findFirstElement(root, text, id, null, contentDesc)
-        root.recycle()
+        val preNode = findFirstElement(preRoot, text, id, null, contentDesc)
+        preRoot.recycle()
 
-        if (node == null) return CommandResponse.error(null, "Element not found")
+        if (preNode == null) return CommandResponse.error(null, "Element not found")
 
         // Walk up to find clickable ancestor if this node isn't clickable
-        var target = node
+        var preTarget: AccessibilityNodeInfo? = preNode
+        while (preTarget != null && !preTarget.isClickable) {
+            val parent = preTarget.parent
+            if (preTarget != preNode) preTarget.recycle()
+            preTarget = parent
+        }
+
+        if (preTarget == null) {
+            preNode.recycle()
+            return CommandResponse.error(null, "No clickable element found")
+        }
+
+        val preTargetCheck = policyEngine.verifyTargetNodePackage(
+            preTarget.packageName?.toString(),
+            preTarget.refresh() && preNode.refresh()
+        )
+        val (safeText, safeDesc) = NodeSanitizer.sanitizeNodeFields(
+            preNode.text?.toString(),
+            preNode.contentDescription?.toString(),
+            preNode.isPassword
+        )
+        val elemSummary = safeText ?: safeDesc ?: id ?: "element"
+
+        if (preTarget != preNode) preTarget.recycle()
+        preNode.recycle()
+
+        if (preTargetCheck.type == PolicyDecisionType.DENY) {
+            auditLogger.record("click_element", currentPackage, elemSummary, "n/a", "denied: ${preTargetCheck.reason}")
+            return CommandResponse.error(null, preTargetCheck.reason)
+        }
+
+        val (approved, consentReason) = requestUserConsent(
+            action = "click_element",
+            targetPackage = currentPackage,
+            targetElement = elemSummary,
+            description = "Click '$elemSummary' in $currentPackage"
+        )
+        if (!approved) {
+            return CommandResponse.error(null, consentReason)
+        }
+
+        // Re-check active foreground window package AFTER consent approval and BEFORE execution
+        val postRoot = rootInActiveWindow ?: run {
+            auditLogger.record("click_element", currentPackage, elemSummary, "approved", "denied: no active window after consent")
+            return CommandResponse.error(null, "No active window after consent")
+        }
+        val postPackage = postRoot.packageName?.toString()
+        val postDecision = policyEngine.evaluate("click_element", postPackage)
+        if (postDecision.type == PolicyDecisionType.DENY) {
+            postRoot.recycle()
+            auditLogger.record("click_element", postPackage ?: "none", elemSummary, "approved", "denied: ${postDecision.reason}")
+            return CommandResponse.error(null, postDecision.reason)
+        }
+
+        val node = findFirstElement(postRoot, text, id, null, contentDesc)
+        postRoot.recycle()
+
+        if (node == null) {
+            auditLogger.record("click_element", postPackage!!, elemSummary, "approved", "denied: element disappeared after consent")
+            return CommandResponse.error(null, "Element not found after consent")
+        }
+
+        var target: AccessibilityNodeInfo? = node
         while (target != null && !target.isClickable) {
             val parent = target.parent
             if (target != node) target.recycle()
@@ -326,17 +602,32 @@ class MobileAccessibilityService : AccessibilityService() {
 
         if (target == null) {
             node.recycle()
-            return CommandResponse.error(null, "No clickable element found")
+            auditLogger.record("click_element", postPackage!!, elemSummary, "approved", "denied: no clickable target after consent")
+            return CommandResponse.error(null, "No clickable element found after consent")
+        }
+
+        val refreshed = target.refresh() && node.refresh()
+        val targetPkg = target.packageName?.toString()
+        val nodePkg = node.packageName?.toString()
+        val targetCheck = policyEngine.verifyTargetNodePackage(targetPkg, refreshed)
+        val nodeCheck = policyEngine.verifyTargetNodePackage(nodePkg, refreshed)
+        if (targetCheck.type == PolicyDecisionType.DENY || nodeCheck.type == PolicyDecisionType.DENY) {
+            val reason = if (targetCheck.type == PolicyDecisionType.DENY) targetCheck.reason else nodeCheck.reason
+            if (target != node) target.recycle()
+            node.recycle()
+            auditLogger.record("click_element", targetPkg ?: postPackage!!, elemSummary, "approved", "denied: $reason")
+            return CommandResponse.error(null, reason)
         }
 
         val result = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        val desc = node.text?.toString() ?: node.contentDescription?.toString() ?: "element"
         if (target != node) target.recycle()
         node.recycle()
 
         return if (result) {
-            CommandResponse.success(null, JsonObject().apply { addProperty("clicked", desc) })
+            auditLogger.record("click_element", targetPkg!!, elemSummary, "approved", "executed")
+            CommandResponse.success(null, JsonObject().apply { addProperty("clicked", elemSummary) })
         } else {
+            auditLogger.record("click_element", targetPkg!!, elemSummary, "approved", "failed")
             CommandResponse.error(null, "Click action failed")
         }
     }
@@ -511,11 +802,17 @@ class MobileAccessibilityService : AccessibilityService() {
     private fun nodeToUINode(node: AccessibilityNodeInfo): UINode {
         val rect = android.graphics.Rect()
         node.getBoundsInScreen(rect)
+        val isPwd = node.isPassword
+        val (safeText, safeDesc) = NodeSanitizer.sanitizeNodeFields(
+            node.text?.toString(),
+            node.contentDescription?.toString(),
+            isPwd
+        )
 
         return UINode(
             className = node.className?.toString(),
-            text = node.text?.toString(),
-            contentDescription = node.contentDescription?.toString(),
+            text = safeText,
+            contentDescription = safeDesc,
             viewId = node.viewIdResourceName,
             isClickable = node.isClickable,
             isScrollable = node.isScrollable,
@@ -524,6 +821,7 @@ class MobileAccessibilityService : AccessibilityService() {
             isChecked = node.isChecked,
             isFocused = node.isFocused,
             isSelected = node.isSelected,
+            isPassword = isPwd,
             bounds = mapOf(
                 "left" to rect.left,
                 "top" to rect.top,

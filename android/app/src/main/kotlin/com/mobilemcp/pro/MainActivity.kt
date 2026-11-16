@@ -1,16 +1,25 @@
 package com.mobilemcp.pro
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.drawable.GradientDrawable
-import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
+import android.os.PersistableBundle
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.mobilemcp.pro.databinding.ActivityMainBinding
+import com.mobilemcp.pro.security.KeyStoreManager
 import com.mobilemcp.pro.server.WebSocketCommandServer
 import com.mobilemcp.pro.service.ConnectionForegroundService
 import com.mobilemcp.pro.service.MobileAccessibilityService
@@ -23,6 +32,17 @@ class MainActivity : AppCompatActivity() {
     private var wsServer: WebSocketCommandServer? = null
     private var isServerRunning = false
     private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private val keyStoreManager: KeyStoreManager by lazy { KeyStoreManager(applicationContext) }
+
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            appendLog("Notification permission granted (required for consent prompts).")
+        } else {
+            appendLog("WARNING: Notification permission denied; all actions will default-deny.")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,6 +51,17 @@ class MainActivity : AppCompatActivity() {
 
         setupUI()
         updateAccessibilityStatus()
+        ensureNotificationPermission()
+    }
+
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 
     override fun onResume() {
@@ -48,7 +79,30 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
+        binding.tvIpAddress.setOnClickListener {
+            copyAuthTokenSafely()
+        }
+
         updateIPAddress()
+    }
+
+    private fun copyAuthTokenSafely() {
+        try {
+            val token = keyStoreManager.getOrCreateAuthToken()
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("DroidPilot Auth Token", token).apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    description.extras = PersistableBundle().apply {
+                        putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                    }
+                }
+            }
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, "Auth token copied to clipboard (masked)", Toast.LENGTH_SHORT).show()
+            appendLog("Auth token copied to clipboard.")
+        } catch (e: Exception) {
+            appendLog("Failed to copy auth token: ${e.message}")
+        }
     }
 
     private fun startServer() {
@@ -58,16 +112,20 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        ensureNotificationPermission()
         val port = binding.etPort.text.toString().toIntOrNull() ?: 8765
 
         try {
+            val authToken = keyStoreManager.getOrCreateAuthToken()
             wsServer = WebSocketCommandServer(
                 port = port,
                 onLog = { message -> runOnUiThread { appendLog(message) } },
                 onConnectionChange = { count ->
                     runOnUiThread { binding.tvConnections.text = count.toString() }
                 }
-            )
+            ).apply {
+                this.authToken = authToken
+            }
             wsServer?.start()
 
             // Start foreground service to keep alive
@@ -78,7 +136,7 @@ class MainActivity : AppCompatActivity() {
 
             isServerRunning = true
             updateServerUI()
-            appendLog("Server started on port $port")
+            appendLog("Server started on 127.0.0.1:$port (auth enabled)")
 
         } catch (e: Exception) {
             appendLog("Failed to start server: ${e.message}")
@@ -151,24 +209,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateIPAddress() {
-        val ip = getDeviceIpAddress()
-        binding.tvIpAddress.text = ip ?: "Not connected to WiFi"
-    }
-
-    private fun getDeviceIpAddress(): String? {
-        try {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val wifiInfo = wifiManager.connectionInfo
-            val ip = wifiInfo.ipAddress
-            if (ip == 0) return null
-            return String.format(
-                "%d.%d.%d.%d",
-                ip and 0xff, ip shr 8 and 0xff,
-                ip shr 16 and 0xff, ip shr 24 and 0xff
-            )
-        } catch (e: Exception) {
-            return null
-        }
+        binding.tvIpAddress.text = "Bound to: 127.0.0.1 (Loopback)\n[Tap to Copy Token Safely]"
     }
 
     private fun appendLog(message: String) {
