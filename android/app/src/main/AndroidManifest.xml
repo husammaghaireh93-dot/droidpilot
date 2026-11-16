@@ -41,6 +41,10 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <receiver
+            android:name=".service.ConsentReceiver"
+            android:exported="false" />
+
         <service
             android:name=".service.ConnectionForegroundService"
             android:exported="false"

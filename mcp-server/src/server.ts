@@ -88,19 +88,11 @@ export function createServer(): McpServer {
       try {
         await client.connect();
 
-        const pingResp = await client.sendCommand("ping");
-        if (!pingResp.success) {
-          throw new Error("Ping failed");
-        }
-
-        const infoResp = await client.sendCommand("get_device_info");
-        const info = infoResp.data || {};
-
         return {
           content: [
             {
               type: "text",
-              text: `Connected to ${info.manufacturer} ${info.model} (Android ${info.release}, ${info.screenWidth}x${info.screenHeight})`,
+              text: `Connected to Android device at ${host}:${port} (authenticated loopback WebSocket; Slice 1 allowlist active)`,
             },
           ],
         };
