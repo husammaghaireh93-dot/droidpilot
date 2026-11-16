@@ -37,6 +37,7 @@ data class UINode(
     val isChecked: Boolean = false,
     val isFocused: Boolean = false,
     val isSelected: Boolean = false,
+    val isPassword: Boolean = false,
     val bounds: Map<String, Int>? = null,
     val packageName: String? = null,
     var children: List<UINode>? = null
