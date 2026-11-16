@@ -1,7 +1,9 @@
 package com.mobilemcp.pro
 
 import com.mobilemcp.pro.security.ConsentCoordinator
+import com.mobilemcp.pro.security.ConsentRateLimiter
 import com.mobilemcp.pro.security.NodeSanitizer
+import com.mobilemcp.pro.security.PackageTier
 import com.mobilemcp.pro.security.PolicyDecisionType
 import com.mobilemcp.pro.security.PolicyEngine
 import com.mobilemcp.pro.server.WebSocketCommandServer
@@ -381,5 +383,231 @@ class SecurityPolicyTest {
         } finally {
             server.shutdown()
         }
+    }
+
+    @Test
+    fun `tier 0 hard deny permanently blocks financial apps settings password managers and installers`() {
+        val hardDeniedPackages = listOf(
+            // Financial / Wallets / Banking
+            "com.reflect",
+            "com.umniah.uwallet",
+            "com.arabbank.mobile",
+            "com.example.mybank",
+            "com.fintech.walletapp",
+            "com.demo.payments",
+            "com.crypto.exchange",
+            "com.company.pay",
+            // System Settings & Security
+            "com.android.settings",
+            "com.android.systemui",
+            // Password Managers & Authenticators
+            "com.x8bit.bitwarden",
+            "com.agilebits.onepassword",
+            "com.lastpass.lpandroid",
+            "com.google.android.apps.authenticator2",
+            // Package Installers & Self-Protection
+            "com.android.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.mobilemcp.pro"
+        )
+
+        // Attempt to forcefully misconfigure TIER_0 packages into read-only and consent-gated sets
+        val engine = PolicyEngine(
+            readOnlyPackages = hardDeniedPackages.toSet() + setOf("com.example.reader"),
+            consentGatedPackages = hardDeniedPackages.toSet() + setOf("com.google.android.calculator")
+        )
+
+        for (pkg in hardDeniedPackages) {
+            assertEquals("Expected TIER_0_HARD_DENY for $pkg", PackageTier.TIER_0_HARD_DENY, engine.classifyPackage(pkg))
+            for (cmd in listOf("get_ui_tree", "click_element", "type_text")) {
+                val decision = engine.evaluate(cmd, pkg)
+                assertEquals("Expected DENY for $cmd on $pkg", PolicyDecisionType.DENY, decision.type)
+                assertEquals(PackageTier.TIER_0_HARD_DENY, decision.tier)
+            }
+            assertEquals(
+                "Expected target node DENY on $pkg",
+                PolicyDecisionType.DENY,
+                engine.verifyTargetNodePackage(pkg, refreshed = true, command = "get_ui_tree").type
+            )
+            assertEquals(
+                "Expected post-consent DENY on $pkg",
+                PolicyDecisionType.DENY,
+                engine.verifyPostConsentContext(pkg, pkg, pkg, refreshed = true).type
+            )
+        }
+    }
+
+    @Test
+    fun `tier 1 read only permits get_ui_tree and blocks all mutation commands`() {
+        val engine = PolicyEngine(
+            readOnlyPackages = PolicyEngine.DEFAULT_READ_ONLY_PACKAGES + setOf("com.example.reader")
+        )
+
+        val readOnlyPackages = listOf(
+            "com.google.android.deskclock",
+            "com.google.android.calendar",
+            "com.example.reader"
+        )
+
+        for (pkg in readOnlyPackages) {
+            assertEquals(PackageTier.TIER_1_READ_ONLY, engine.classifyPackage(pkg))
+
+            val readDecision = engine.evaluate("get_ui_tree", pkg)
+            assertEquals(PolicyDecisionType.ALLOW, readDecision.type)
+            assertEquals(PackageTier.TIER_1_READ_ONLY, readDecision.tier)
+
+            assertEquals(
+                PolicyDecisionType.ALLOW,
+                engine.verifyTargetNodePackage(pkg, refreshed = true, command = "get_ui_tree").type
+            )
+
+            for (mutation in listOf("click_element", "type_text")) {
+                val mutDecision = engine.evaluate(mutation, pkg)
+                assertEquals("Expected DENY for $mutation on TIER_1 $pkg", PolicyDecisionType.DENY, mutDecision.type)
+                assertEquals(PackageTier.TIER_1_READ_ONLY, mutDecision.tier)
+
+                assertEquals(
+                    PolicyDecisionType.DENY,
+                    engine.verifyTargetNodePackage(pkg, refreshed = true, command = mutation).type
+                )
+            }
+
+            // Even post-consent verifier rejects TIER_1_READ_ONLY packages
+            assertEquals(
+                PolicyDecisionType.DENY,
+                engine.verifyPostConsentContext(pkg, pkg, pkg, refreshed = true).type
+            )
+        }
+
+        // TIER_2_CONSENT_GATED includes Honor/Huawei calculator variants and custom approved non-financial apps
+        val customEngine = PolicyEngine(
+            consentGatedPackages = PolicyEngine.DEFAULT_CONSENT_GATED_PACKAGES + setOf("com.example.notes")
+        )
+        for (pkg in listOf("com.hihonor.calculator", "com.huawei.calculator", "com.example.notes")) {
+            assertEquals(PackageTier.TIER_2_CONSENT_GATED, customEngine.classifyPackage(pkg))
+            assertEquals(PolicyDecisionType.REQUIRE_CONSENT, customEngine.evaluate("click_element", pkg).type)
+            assertEquals(PolicyDecisionType.ALLOW, customEngine.verifyPostConsentContext(pkg, pkg, pkg, refreshed = true).type)
+        }
+    }
+
+    @Test
+    fun `consent rate limiter enforces 5 per minute sliding window`() {
+        var fakeClockMs = 100_000L
+        var nonceSeq = 0
+        val coordinator = ConsentCoordinator(
+            timeoutMs = 5_000L,
+            clock = { fakeClockMs },
+            nonceGenerator = { "win-nonce-${++nonceSeq}" }
+        )
+
+        // 5 approved consent prompts within 1 minute succeed
+        for (i in 1..5) {
+            val start = coordinator.startConsent(notificationsEnabled = true)
+            assertTrue("Request #$i should start", start is ConsentCoordinator.StartResult.Started)
+            val session = (start as ConsentCoordinator.StartResult.Started).session
+            assertTrue(coordinator.submitDecision(session.nonce, approved = true))
+            assertTrue(coordinator.awaitResult(session))
+            fakeClockMs += 5_000L // t = 100s, 105s, 110s, 115s, 120s
+        }
+
+        // 6th request at t = 125s (within 60s of request #1 at 100s) must be rate-limited
+        val blocked = coordinator.startConsent(notificationsEnabled = true)
+        assertTrue(blocked is ConsentCoordinator.StartResult.Denied)
+        val denied = blocked as ConsentCoordinator.StartResult.Denied
+        assertTrue(denied.rateLimited)
+        assertFalse(denied.cooldownActive)
+
+        // Advance clock to t = 160_000L (60s after request #1 at 100_000L) -> slot reopens
+        fakeClockMs = 160_000L
+        val reopened = coordinator.startConsent(notificationsEnabled = true)
+        assertTrue("Slot should reopen after 60s sliding window", reopened is ConsentCoordinator.StartResult.Started)
+        val reopenedSession = (reopened as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(reopenedSession.nonce, approved = true))
+        assertTrue(coordinator.awaitResult(reopenedSession))
+    }
+
+    @Test
+    fun `consent rate limiter triggers 60s cooldown after 3 consecutive denials or timeouts and recovers after cooldown`() {
+        var fakeClockMs = 10_000L
+        var nonceSeq = 0
+        val auditLogger = AuditLogger(tempFolder.root)
+        val cooldownEvents = mutableListOf<Long>()
+
+        val coordinator = ConsentCoordinator(
+            timeoutMs = 5_000L,
+            clock = { fakeClockMs },
+            nonceGenerator = { "cd-nonce-${++nonceSeq}" },
+            onCooldownTriggered = { untilMs ->
+                cooldownEvents.add(untilMs)
+                auditLogger.record(
+                    action = "consent_rate_limiter",
+                    targetPackage = "system",
+                    targetElement = null,
+                    consent = "cooldown",
+                    status = "cooldown_activated_60s(until=$untilMs)"
+                )
+            }
+        )
+
+        // 1st failure: explicit denial
+        val s1 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(s1.nonce, approved = false))
+        assertFalse(coordinator.awaitResult(s1))
+        assertFalse(coordinator.rateLimiter.isCooldownActive())
+
+        // 2nd failure: timeout
+        fakeClockMs += 1_000L
+        val s2 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertFalse(coordinator.awaitResult(s2) { fakeClockMs += 6_000L })
+        assertFalse(coordinator.rateLimiter.isCooldownActive())
+
+        // An approval resets consecutive failure streak!
+        fakeClockMs += 1_000L
+        val sApproved = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(sApproved.nonce, approved = true))
+        assertTrue(coordinator.awaitResult(sApproved))
+        assertEquals(0, coordinator.rateLimiter.consecutiveFailureCount())
+
+        // Advance past sliding window so we have clean quota for 3 consecutive failures
+        fakeClockMs += 65_000L
+
+        // 3 consecutive failures (2 denials + 1 timeout) must trigger 60s cooldown
+        val f1 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(f1.nonce, approved = false))
+        assertFalse(coordinator.awaitResult(f1))
+
+        fakeClockMs += 1_000L
+        val f2 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(f2.nonce, approved = false))
+        assertFalse(coordinator.awaitResult(f2))
+
+        fakeClockMs += 1_000L
+        val f3 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertFalse(coordinator.awaitResult(f3) { fakeClockMs += 6_000L })
+
+        assertTrue("Cooldown must be active after 3 consecutive failures", coordinator.rateLimiter.isCooldownActive())
+        assertEquals(1, cooldownEvents.size)
+        assertEquals(ConsentRateLimiter.DEFAULT_COOLDOWN_MS, coordinator.rateLimiter.remainingCooldownMs())
+
+        // Audit log recorded cooldown activation with valid hash chain
+        val lines = auditLogger.getLogLines()
+        assertEquals(1, lines.size)
+        assertTrue(lines[0].contains("cooldown_activated_60s"))
+        assertTrue(AuditLogger.verifyChainIntegrity(lines))
+
+        // Requests during cooldown are immediately denied
+        fakeClockMs += 30_000L
+        val duringCooldown = coordinator.startConsent(true)
+        assertTrue(duringCooldown is ConsentCoordinator.StartResult.Denied)
+        assertTrue((duringCooldown as ConsentCoordinator.StartResult.Denied).cooldownActive)
+
+        // Advance past remaining 30s of cooldown -> requests work again
+        fakeClockMs += 31_000L
+        assertFalse(coordinator.rateLimiter.isCooldownActive())
+        val recovered = coordinator.startConsent(true)
+        assertTrue("Consent should succeed after cooldown expires", recovered is ConsentCoordinator.StartResult.Started)
+        val recSession = (recovered as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(recSession.nonce, approved = true))
+        assertTrue(coordinator.awaitResult(recSession))
     }
 }
