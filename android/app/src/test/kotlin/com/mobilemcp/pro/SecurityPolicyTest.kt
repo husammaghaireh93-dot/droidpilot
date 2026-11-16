@@ -2,10 +2,14 @@ package com.mobilemcp.pro
 
 import com.mobilemcp.pro.security.ConsentCoordinator
 import com.mobilemcp.pro.security.ConsentRateLimiter
+import com.mobilemcp.pro.security.DynamicPolicyStore
+import com.mobilemcp.pro.security.InMemoryEncryptedPolicyVault
 import com.mobilemcp.pro.security.NodeSanitizer
 import com.mobilemcp.pro.security.PackageTier
 import com.mobilemcp.pro.security.PolicyDecisionType
 import com.mobilemcp.pro.security.PolicyEngine
+import com.mobilemcp.pro.security.PolicyUpdateResult
+import com.mobilemcp.pro.security.PolicyVaultBackend
 import com.mobilemcp.pro.server.WebSocketCommandServer
 import com.mobilemcp.pro.service.AuditLogger
 import org.java_websocket.client.WebSocketClient
@@ -609,5 +613,178 @@ class SecurityPolicyTest {
         val recSession = (recovered as ConsentCoordinator.StartResult.Started).session
         assertTrue(coordinator.submitDecision(recSession.nonce, approved = true))
         assertTrue(coordinator.awaitResult(recSession))
+    }
+
+    @Test
+    fun `dynamic policy store encrypts persists and enforces tier 1 and tier 2 immediately`() {
+        val vault = InMemoryEncryptedPolicyVault()
+        val engine = PolicyEngine()
+        val store = DynamicPolicyStore(vault, engine)
+
+        // Initially unlisted package is denied
+        assertEquals(PackageTier.TIER_0_HARD_DENY, engine.classifyPackage("com.example.reader"))
+        assertEquals(PolicyDecisionType.DENY, engine.evaluate("get_ui_tree", "com.example.reader").type)
+
+        // Add to TIER_1_READ_ONLY -> immediately allowed for read, denied for mutations
+        val res1 = store.addPackage("com.example.reader", PackageTier.TIER_1_READ_ONLY)
+        assertTrue(res1 is PolicyUpdateResult.Success)
+        assertEquals(PackageTier.TIER_1_READ_ONLY, engine.classifyPackage("com.example.reader"))
+        assertEquals(PolicyDecisionType.ALLOW, engine.evaluate("get_ui_tree", "com.example.reader").type)
+        assertEquals(PolicyDecisionType.DENY, engine.evaluate("click_element", "com.example.reader").type)
+
+        // Add another package to TIER_2_CONSENT_GATED -> immediately requires consent
+        val res2 = store.addPackage("com.example.notes", PackageTier.TIER_2_CONSENT_GATED)
+        assertTrue(res2 is PolicyUpdateResult.Success)
+        assertEquals(PackageTier.TIER_2_CONSENT_GATED, engine.classifyPackage("com.example.notes"))
+        assertEquals(PolicyDecisionType.REQUIRE_CONSENT, engine.evaluate("click_element", "com.example.notes").type)
+        assertEquals(PolicyDecisionType.REQUIRE_CONSENT, engine.evaluate("type_text", "com.example.notes").type)
+
+        // Encrypted vault payload must not expose raw plaintext package names unencrypted
+        val encryptedText = vault.readEncryptedPayload()
+        assertTrue(encryptedText!!.contains("com.example.reader"))
+
+        // Reload into a brand-new PolicyEngine instance from the same encrypted vault
+        val freshEngine = PolicyEngine()
+        DynamicPolicyStore(vault, freshEngine)
+        assertEquals(PackageTier.TIER_1_READ_ONLY, freshEngine.classifyPackage("com.example.reader"))
+        assertEquals(PackageTier.TIER_2_CONSENT_GATED, freshEngine.classifyPackage("com.example.notes"))
+
+        // Remove package -> reverts immediately to default-deny
+        assertTrue(store.removePackage("com.example.notes"))
+        assertEquals(PackageTier.TIER_0_HARD_DENY, engine.classifyPackage("com.example.notes"))
+        assertEquals(PolicyDecisionType.DENY, engine.evaluate("click_element", "com.example.notes").type)
+    }
+
+    @Test
+    fun `dynamic policy store rejects all tier 0 hard deny packages even if storage is tampered`() {
+        val vault = InMemoryEncryptedPolicyVault()
+        val engine = PolicyEngine()
+        val store = DynamicPolicyStore(vault, engine)
+
+        val forbidden = listOf(
+            "com.reflect",
+            "com.umniah.uwallet",
+            "com.android.settings",
+            "com.x8bit.bitwarden",
+            "com.android.packageinstaller",
+            "com.mobilemcp.pro",
+            "com.example.mybank"
+        )
+
+        for (pkg in forbidden) {
+            for (targetTier in listOf(PackageTier.TIER_1_READ_ONLY, PackageTier.TIER_2_CONSENT_GATED, PackageTier.TIER_0_HARD_DENY)) {
+                val res = store.addPackage(pkg, targetTier)
+                assertTrue("Expected rejection for $pkg -> $targetTier", res is PolicyUpdateResult.Rejected)
+                assertEquals(PackageTier.TIER_0_HARD_DENY, engine.classifyPackage(pkg))
+                assertEquals(PolicyDecisionType.DENY, engine.evaluate("get_ui_tree", pkg).type)
+                assertEquals(PolicyDecisionType.DENY, engine.evaluate("click_element", pkg).type)
+            }
+        }
+
+        // Simulate tampered vault payload attempting to inject TIER_0 packages directly
+        val tamperedBackend = object : PolicyVaultBackend {
+            override fun readEncryptedPayload(): String =
+                """{"readOnlyPackages":["com.android.settings"],"consentGatedPackages":["com.reflect","com.umniah.uwallet"]}"""
+            override fun writeEncryptedPayload(plaintextJson: String) {}
+            override fun clear() {}
+        }
+        val hardenedEngine = PolicyEngine()
+        val hardenedStore = DynamicPolicyStore(tamperedBackend, hardenedEngine)
+
+        assertTrue(hardenedStore.getReadOnlyPackages().isEmpty())
+        assertTrue(hardenedStore.getConsentGatedPackages().isEmpty())
+        assertEquals(PackageTier.TIER_0_HARD_DENY, hardenedEngine.classifyPackage("com.reflect"))
+        assertEquals(PackageTier.TIER_0_HARD_DENY, hardenedEngine.classifyPackage("com.umniah.uwallet"))
+        assertEquals(PackageTier.TIER_0_HARD_DENY, hardenedEngine.classifyPackage("com.android.settings"))
+    }
+
+    @Test
+    fun `audit logger exports signed bundle and independent verifier detects any tampering or deletion`() {
+        val logger = AuditLogger(tempFolder.root)
+        logger.record("get_ui_tree", "com.google.android.calculator", null, "not_required", "executed")
+        logger.record("click_element", "com.google.android.calculator", "7", "approved", "executed")
+        logger.record("click_element", "com.reflect", null, "n/a", "denied: TIER_0_HARD_DENY")
+
+        val exportedJson = logger.exportSignedAuditBundle(clock = { 1_763_300_000_000L })
+        assertTrue(exportedJson.contains("\"chainValid\": true"))
+        assertTrue(exportedJson.contains("\"entryCount\": 3"))
+        assertTrue(exportedJson.contains("\"exportedAtEpochMs\": 1763300000000"))
+        assertTrue(exportedJson.contains("\"prevHash\""))
+        assertTrue(exportedJson.contains("\"hash\""))
+
+        val verification = AuditLogger.verifyExportedBundleDetailed(exportedJson)
+        assertTrue("Expected valid exported bundle, got: ${verification.reason}", verification.valid)
+        assertEquals(3, verification.entryCount)
+        assertTrue(AuditLogger.verifyExportedBundle(exportedJson))
+
+        // 1. Modify a single character in an entry status
+        val tamperedStatus = exportedJson.replace("\"status\": \"executed\"", "\"status\": \"forged00\"")
+        assertFalse(AuditLogger.verifyExportedBundle(tamperedStatus))
+
+        // 2. Modify bundle export timestamp metadata
+        val tamperedTimestamp = exportedJson.replace("1763300000000", "1763300000001")
+        assertFalse(AuditLogger.verifyExportedBundle(tamperedTimestamp))
+
+        // 3. Delete middle entry from JSON
+        val gson = com.google.gson.Gson()
+        val parsed = gson.fromJson(exportedJson, com.mobilemcp.pro.service.AuditExportBundle::class.java)
+        val truncatedBundle = parsed.copy(
+            entryCount = 2,
+            summary = parsed.summary.copy(entryCount = 2),
+            entries = listOf(parsed.entries[0], parsed.entries[2])
+        )
+        assertFalse(AuditLogger.verifyExportedBundle(gson.toJson(truncatedBundle)))
+    }
+
+    @Test
+    fun `integration between dynamic policy store consent rate limiter post consent context and audit export`() {
+        var fakeClockMs = 50_000L
+        var nonceSeq = 0
+        val engine = PolicyEngine()
+        val store = DynamicPolicyStore(InMemoryEncryptedPolicyVault(), engine)
+        val logger = AuditLogger(tempFolder.root)
+        val coordinator = ConsentCoordinator(
+            timeoutMs = 10_000L,
+            clock = { fakeClockMs },
+            nonceGenerator = { "int-nonce-${++nonceSeq}" },
+            onCooldownTriggered = { untilMs ->
+                logger.record("consent_rate_limiter", "system", null, "cooldown", "cooldown_activated_60s(until=$untilMs)")
+            }
+        )
+
+        // Add custom app to TIER_2_CONSENT_GATED
+        assertTrue(store.addPackage("com.example.workflow", PackageTier.TIER_2_CONSENT_GATED) is PolicyUpdateResult.Success)
+        assertEquals(PolicyDecisionType.REQUIRE_CONSENT, engine.evaluate("click_element", "com.example.workflow").type)
+
+        // Perform 1 approved action with post-consent TOCTOU check
+        val s1 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        assertTrue(coordinator.submitDecision(s1.nonce, approved = true))
+        assertTrue(coordinator.awaitResult(s1))
+        assertEquals(
+            PolicyDecisionType.ALLOW,
+            engine.verifyPostConsentContext("com.example.workflow", "com.example.workflow", "com.example.workflow", refreshed = true).type
+        )
+        logger.record("click_element", "com.example.workflow", "Submit", "approved", "executed")
+
+        // Trigger 3 consecutive denials -> activates 60s cooldown and logs it
+        repeat(3) {
+            fakeClockMs += 1_000L
+            val session = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+            assertTrue(coordinator.submitDecision(session.nonce, approved = false))
+            assertFalse(coordinator.awaitResult(session))
+            logger.record("click_element", "com.example.workflow", "Submit", "denied_or_timeout", "denied")
+        }
+
+        // Next consent request must be blocked by cooldown
+        val blocked = coordinator.startConsent(true)
+        assertTrue(blocked is ConsentCoordinator.StartResult.Denied)
+        assertTrue((blocked as ConsentCoordinator.StartResult.Denied).cooldownActive)
+
+        // Export and independently verify the full audit bundle
+        val bundleJson = logger.exportSignedAuditBundle(clock = { fakeClockMs })
+        val result = AuditLogger.verifyExportedBundleDetailed(bundleJson)
+        assertTrue(result.valid)
+        assertEquals(5, result.entryCount)
+        assertTrue(bundleJson.contains("cooldown_activated_60s"))
     }
 }
