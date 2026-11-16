@@ -1,4 +1,4 @@
-# Slice 1 Verification & Security Test Plan
+# DroidPilot Hardening Verification & Security Test Plan (Slice 1 + Slice 2)
 
 ## 1. Strict Preconditions (Mandatory Before Any On-Device Test)
 1. **Wireless Debugging (`ADB` over Wi-Fi) MUST be OFF** in Developer Options.
@@ -60,3 +60,26 @@ Executed via `./gradlew testDebugUnitTest` inside `android/`:
 ### T7: Gesture Injection Attempt Over Consent Notification (`swipe` / `tap`)
 - While a consent notification is displayed at the top of the screen, send `swipe` (or `tap` / `long_press`) from the agent to drag/tap the `Approve` action button coordinates.
 - **Expected**: Immediately denied at `PolicyEngine.evaluate` (`Command 'swipe' is denied by default-deny allowlist.`), and `accessibility_service_config.xml` also sets `android:canPerformGestures="false"`. Zero gestures can be dispatched.
+
+---
+
+## 4. Slice 2 Automated & On-Device Scenarios (Tiered Package Model + Consent Rate Limiter)
+
+### Automated JVM Tests Added in `SecurityPolicyTest`
+- **`TIER_0_HARD_DENY` (Non-Overridable)**:
+  - Permanently blocks financial/banking/wallet apps (`com.reflect`, `com.umniah.uwallet`, and keyword matches like `*bank*`, `*wallet*`, `*fintech*`, `*payment*`, `*crypto*`, `*pay*`), system settings (`com.android.settings`), password managers/authenticators (`com.x8bit.bitwarden`, `com.agilebits.onepassword`, `com.lastpass.lpandroid`, `com.google.android.apps.authenticator2`), package installers (`com.android.packageinstaller`, `com.google.android.packageinstaller`), and self-protection (`com.mobilemcp.pro`).
+  - Verified non-overridable even if passed explicitly to `PolicyEngine(readOnlyPackages = ..., consentGatedPackages = ...)`.
+- **`TIER_1_READ_ONLY`**:
+  - Permits `get_ui_tree` (with `NodeSanitizer` redacting `isPassword` fields) on read-only packages (`com.google.android.deskclock`, `com.google.android.calendar`, etc.).
+  - Strictly denies `click_element` and `type_text` at `evaluate`, `verifyTargetNodePackage`, and `verifyPostConsentContext`.
+- **`TIER_2_CONSENT_GATED`**:
+  - Covers Calculator variants (`com.google.android.calculator`, `com.android.calculator2`, `com.hihonor.calculator`, `com.huawei.calculator`) and explicitly approved non-financial apps.
+  - Requires per-action consent and strict `verifyPostConsentContext` match.
+- **`ConsentRateLimiter`**:
+  - Enforces max 5 consent prompts per 60s sliding window; 6th request is denied with `rateLimited = true` until the oldest timestamp ages out (>= 60s).
+  - Enforces mandatory 60s cooldown after 3 consecutive denials/timeouts, logs `cooldown_activated_60s` into `AuditLogger` with valid SHA-256 chain integrity, resets failure streak upon approval, and recovers cleanly once the 60s cooldown expires.
+
+### Manual Slice 2 Verification Scenarios
+- **T8 (`TIER_0_HARD_DENY` Financial & Settings)**: Open `com.reflect`, `com.umniah.uwallet`, or `com.android.settings` -> `get_ui_tree`, `click_element`, and `type_text` are all immediately denied (`TIER_0_HARD_DENY`).
+- **T9 (`TIER_1_READ_ONLY` Clock / Calendar)**: Open Clock (`com.google.android.deskclock` / `com.hihonor.deskclock`) -> `get_ui_tree` succeeds with `NodeSanitizer`; `click_element` and `type_text` are immediately denied without showing a consent prompt.
+- **T10 (`ConsentRateLimiter` Flood & Cooldown)**: Trigger 3 consecutive consent denials/timeouts in Calculator -> 4th `click_element` immediately returns cooldown error without prompting; `audit_chain.jsonl` records `cooldown_activated_60s`; after 60s, prompts resume normally. Trigger 5 rapid prompts within 1 minute -> 6th prompt is rate-limited until the sliding window advances.

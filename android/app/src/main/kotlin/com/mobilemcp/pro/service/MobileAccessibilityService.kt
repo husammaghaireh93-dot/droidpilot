@@ -48,8 +48,20 @@ class MobileAccessibilityService : AccessibilityService() {
     private val gson = Gson()
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val policyEngine = PolicyEngine()
-    private val consentCoordinator = ConsentCoordinator()
     private val auditLogger: AuditLogger by lazy { AuditLogger(filesDir) }
+    private val consentCoordinator: ConsentCoordinator by lazy {
+        ConsentCoordinator(
+            onCooldownTriggered = { cooldownUntilMs ->
+                auditLogger.record(
+                    action = "consent_rate_limiter",
+                    targetPackage = "system",
+                    targetElement = null,
+                    consent = "cooldown",
+                    status = "cooldown_activated_60s(until=$cooldownUntilMs)"
+                )
+            }
+        )
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -126,7 +138,12 @@ class MobileAccessibilityService : AccessibilityService() {
 
         val startResult = consentCoordinator.startConsent(areNotificationsEnabled())
         if (startResult is ConsentCoordinator.StartResult.Denied) {
-            auditLogger.record(action, targetPackage, targetElement, "denied", startResult.reason)
+            val consentTag = when {
+                startResult.cooldownActive -> "cooldown_active"
+                startResult.rateLimited -> "rate_limited"
+                else -> "denied"
+            }
+            auditLogger.record(action, targetPackage, targetElement, consentTag, startResult.reason)
             return Pair(false, startResult.reason)
         }
 
@@ -369,7 +386,7 @@ class MobileAccessibilityService : AccessibilityService() {
             auditLogger.record("type_text", currentPackage, "password_field", "n/a", "denied: password field protected")
             return CommandResponse.error(null, "Typing into password fields is blocked")
         }
-        val prePkgCheck = policyEngine.verifyTargetNodePackage(prePkg, preRefreshed)
+        val prePkgCheck = policyEngine.verifyTargetNodePackage(prePkg, preRefreshed, "type_text")
         if (prePkgCheck.type == PolicyDecisionType.DENY) {
             auditLogger.record("type_text", prePkg ?: currentPackage, "focused_input", "n/a", "denied: ${prePkgCheck.reason}")
             return CommandResponse.error(null, prePkgCheck.reason)
@@ -495,7 +512,7 @@ class MobileAccessibilityService : AccessibilityService() {
 
         val refreshed = root.refresh()
         val rootPkg = root.packageName?.toString()
-        val pkgCheck = policyEngine.verifyTargetNodePackage(rootPkg, refreshed)
+        val pkgCheck = policyEngine.verifyTargetNodePackage(rootPkg, refreshed, "get_ui_tree")
         if (pkgCheck.type == PolicyDecisionType.DENY) {
             root.recycle()
             auditLogger.record("get_ui_tree", rootPkg ?: currentPackage, null, "not_required", "denied: ${pkgCheck.reason}")
@@ -557,7 +574,8 @@ class MobileAccessibilityService : AccessibilityService() {
 
         val preTargetCheck = policyEngine.verifyTargetNodePackage(
             preTarget.packageName?.toString(),
-            preTarget.refresh() && preNode.refresh()
+            preTarget.refresh() && preNode.refresh(),
+            "click_element"
         )
         val (safeText, safeDesc) = NodeSanitizer.sanitizeNodeFields(
             preNode.text?.toString(),
