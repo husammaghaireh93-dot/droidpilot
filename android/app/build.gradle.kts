@@ -15,8 +15,34 @@ android {
         versionName = "1.0.0"
     }
 
+    signingConfigs {
+        create("unifiedSigning") {
+            val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+            val keystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            val keyAliasStr = System.getenv("ANDROID_KEY_ALIAS")
+            val keyPasswordStr = System.getenv("ANDROID_KEY_PASSWORD")
+
+            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                keyAlias = keyAliasStr
+                keyPassword = keyPasswordStr
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            val unified = signingConfigs.getByName("unifiedSigning")
+            if (unified.storeFile != null) {
+                signingConfig = unified
+            }
+        }
         release {
+            val unified = signingConfigs.getByName("unifiedSigning")
+            if (unified.storeFile != null) {
+                signingConfig = unified
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
