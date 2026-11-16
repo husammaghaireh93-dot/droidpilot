@@ -102,4 +102,45 @@ class PolicyEngine(
             "Target node verified on whitelisted package '$targetPackage'."
         )
     }
+
+    /**
+     * Post-consent TOCTOU guard: verifies that after user approval and right before
+     * performAction(), the active foreground window package and refreshed target node package
+     * still strictly match the exact package the user approved in the consent notification.
+     */
+    fun verifyPostConsentContext(
+        consentedPackage: String?,
+        currentPackage: String?,
+        targetPackage: String?,
+        refreshed: Boolean
+    ): PolicyDecision {
+        if (!refreshed) {
+            return PolicyDecision(
+                PolicyDecisionType.DENY,
+                "Target node refresh() failed; UI hierarchy changed after consent."
+            )
+        }
+        if (consentedPackage.isNullOrBlank() || consentedPackage !in allowedPackages) {
+            return PolicyDecision(
+                PolicyDecisionType.DENY,
+                "Consented package '${consentedPackage ?: "null"}' is not in the allowed package whitelist."
+            )
+        }
+        if (currentPackage != consentedPackage) {
+            return PolicyDecision(
+                PolicyDecisionType.DENY,
+                "Active foreground package '${currentPackage ?: "null"}' changed from consented '$consentedPackage'."
+            )
+        }
+        if (targetPackage != consentedPackage) {
+            return PolicyDecision(
+                PolicyDecisionType.DENY,
+                "Target node package '${targetPackage ?: "null"}' does not match consented '$consentedPackage'."
+            )
+        }
+        return PolicyDecision(
+            PolicyDecisionType.ALLOW,
+            "Post-consent foreground window and node verified for '$consentedPackage'."
+        )
+    }
 }

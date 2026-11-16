@@ -6,6 +6,8 @@ import com.mobilemcp.pro.security.PolicyDecisionType
 import com.mobilemcp.pro.security.PolicyEngine
 import com.mobilemcp.pro.server.WebSocketCommandServer
 import com.mobilemcp.pro.service.AuditLogger
+import org.java_websocket.client.WebSocketClient
+import org.java_websocket.handshake.ServerHandshake
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -14,6 +16,11 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.URI
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class SecurityPolicyTest {
 
@@ -195,5 +202,185 @@ class SecurityPolicyTest {
         // Delete middle record
         val deleted = listOf(lines[0], lines[2], lines[3])
         assertFalse(AuditLogger.verifyChainIntegrity(deleted))
+    }
+
+    @Test
+    fun `post-consent TOCTOU verifier rejects overlay switches cross-package swaps and stale nodes`() {
+        val engine = PolicyEngine()
+
+        // Exact match with refreshed node succeeds
+        assertEquals(
+            PolicyDecisionType.ALLOW,
+            engine.verifyPostConsentContext(
+                consentedPackage = "com.google.android.calculator",
+                currentPackage = "com.google.android.calculator",
+                targetPackage = "com.google.android.calculator",
+                refreshed = true
+            ).type
+        )
+
+        // Overlay or foreground switch to non-whitelisted app denied
+        assertEquals(
+            PolicyDecisionType.DENY,
+            engine.verifyPostConsentContext(
+                consentedPackage = "com.google.android.calculator",
+                currentPackage = "com.android.systemui",
+                targetPackage = "com.google.android.calculator",
+                refreshed = true
+            ).type
+        )
+
+        // Cross-package switch even between two whitelisted packages denied
+        assertEquals(
+            PolicyDecisionType.DENY,
+            engine.verifyPostConsentContext(
+                consentedPackage = "com.google.android.calculator",
+                currentPackage = "com.android.calculator2",
+                targetPackage = "com.android.calculator2",
+                refreshed = true
+            ).type
+        )
+
+        // Target node belonging to another package denied
+        assertEquals(
+            PolicyDecisionType.DENY,
+            engine.verifyPostConsentContext(
+                consentedPackage = "com.google.android.calculator",
+                currentPackage = "com.google.android.calculator",
+                targetPackage = "com.android.settings",
+                refreshed = true
+            ).type
+        )
+
+        // Failed node.refresh() denied
+        assertEquals(
+            PolicyDecisionType.DENY,
+            engine.verifyPostConsentContext(
+                consentedPackage = "com.google.android.calculator",
+                currentPackage = "com.google.android.calculator",
+                targetPackage = "com.google.android.calculator",
+                refreshed = false
+            ).type
+        )
+    }
+
+    @Test
+    fun `consent coordinator purges pending session and nonce in finally when wait throws`() {
+        var fakeClockMs = 5_000L
+        var nonceSeq = 0
+        val coordinator = ConsentCoordinator(
+            timeoutMs = 15_000L,
+            clock = { fakeClockMs },
+            nonceGenerator = { "nonce-${++nonceSeq}" }
+        )
+
+        val session1 = (coordinator.startConsent(true) as ConsentCoordinator.StartResult.Started).session
+        try {
+            coordinator.awaitResult(session1) {
+                throw IllegalStateException("Simulated wait interruption")
+            }
+        } catch (_: IllegalStateException) {
+            // Expected
+        }
+
+        // Old nonce must be purged from memory immediately without waiting for timeout
+        assertFalse(coordinator.submitDecision(session1.nonce, approved = true))
+
+        // A brand new consent session must start cleanly right away
+        val session2 = coordinator.startConsent(true)
+        assertTrue(session2 is ConsentCoordinator.StartResult.Started)
+    }
+
+    @Test
+    fun `websocket token rotation disconnects active clients immediately and invalidates old token`() {
+        val port = ServerSocket(0).use { it.localPort }
+        val startedLatch = CountDownLatch(1)
+        val connCount = AtomicInteger(0)
+        val firstConnectedLatch = CountDownLatch(1)
+        val secondConnectedLatch = CountDownLatch(1)
+        val rotated = AtomicInteger(0)
+        val server = object : WebSocketCommandServer(
+            port = port,
+            onLog = {},
+            onConnectionChange = { count ->
+                connCount.set(count)
+                if (count == 1) {
+                    if (rotated.get() == 0) firstConnectedLatch.countDown() else secondConnectedLatch.countDown()
+                }
+            }
+        ) {
+            override fun onStart() {
+                super.onStart()
+                startedLatch.countDown()
+            }
+        }
+        server.authToken = "initial-token-alpha"
+        server.start()
+
+        try {
+            assertTrue("Server failed to start", startedLatch.await(5, TimeUnit.SECONDS))
+
+            val closeLatch = CountDownLatch(1)
+            val closedCode = AtomicInteger(-1)
+            val client1 = object : WebSocketClient(
+                URI("ws://127.0.0.1:$port"),
+                mapOf("Authorization" to "Bearer initial-token-alpha")
+            ) {
+                override fun onOpen(handshakedata: ServerHandshake?) {}
+                override fun onMessage(message: String?) {}
+                override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                    closedCode.set(code)
+                    closeLatch.countDown()
+                }
+                override fun onError(ex: Exception?) {}
+            }
+
+            assertTrue("Client 1 failed to connect", client1.connectBlocking(5, TimeUnit.SECONDS))
+            assertTrue("Server did not register client 1", firstConnectedLatch.await(5, TimeUnit.SECONDS))
+            assertEquals(1, server.getConnectionCount())
+
+            // Rotate token: must immediately drop active client1 with 4001
+            rotated.set(1)
+            server.rotateAuthToken("rotated-token-beta")
+            assertTrue("Active client was not closed on rotation", closeLatch.await(5, TimeUnit.SECONDS))
+            assertEquals(4001, closedCode.get())
+            assertEquals(0, server.getConnectionCount())
+
+            // Old token handshake must now be rejected
+            val oldRejectLatch = CountDownLatch(1)
+            val oldCloseCode = AtomicInteger(-1)
+            val staleClient = object : WebSocketClient(
+                URI("ws://127.0.0.1:$port"),
+                mapOf("Authorization" to "Bearer initial-token-alpha")
+            ) {
+                override fun onOpen(handshakedata: ServerHandshake?) {}
+                override fun onMessage(message: String?) {}
+                override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                    oldCloseCode.set(code)
+                    oldRejectLatch.countDown()
+                }
+                override fun onError(ex: Exception?) {}
+            }
+            staleClient.connectBlocking(5, TimeUnit.SECONDS)
+            assertTrue(oldRejectLatch.await(5, TimeUnit.SECONDS))
+            assertEquals(4001, oldCloseCode.get())
+
+            // New token connects cleanly
+            val freshClient = object : WebSocketClient(
+                URI("ws://127.0.0.1:$port"),
+                mapOf("Authorization" to "Bearer rotated-token-beta")
+            ) {
+                override fun onOpen(handshakedata: ServerHandshake?) {}
+                override fun onMessage(message: String?) {}
+                override fun onClose(code: Int, reason: String?, remote: Boolean) {}
+                override fun onError(ex: Exception?) {}
+            }
+            assertTrue("Fresh client with rotated token failed", freshClient.connectBlocking(5, TimeUnit.SECONDS))
+            assertTrue("Server did not register fresh client", secondConnectedLatch.await(5, TimeUnit.SECONDS))
+            assertEquals(1, server.getConnectionCount())
+            freshClient.closeBlocking()
+        } finally {
+            server.shutdown()
+        }
     }
 }

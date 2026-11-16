@@ -113,31 +113,38 @@ class ConsentCoordinator(
         waitStep: ((Long) -> Unit)? = null
     ): Boolean {
         synchronized(lock) {
-            while (true) {
-                val resolved = pendingDecision
-                if (resolved != null) {
-                    pendingDecision = null
+            try {
+                while (true) {
+                    val resolved = pendingDecision
+                    if (resolved != null) {
+                        pendingDecision = null
+                        activeSession = null
+                        return resolved
+                    }
+
+                    // If session was cleared externally without setting pendingDecision, deny
+                    if (activeSession?.nonce != session.nonce) {
+                        pendingDecision = null
+                        return false
+                    }
+
+                    val remaining = session.expiresAtMs - clock()
+                    if (remaining <= 0L) {
+                        return false
+                    }
+
+                    if (waitStep != null) {
+                        waitStep(remaining)
+                    } else {
+                        lock.wait(remaining)
+                    }
+                }
+            } finally {
+                // Always purge active session & nonce on timeout, cancellation, or exception
+                if (activeSession?.nonce == session.nonce) {
                     activeSession = null
-                    return resolved
-                }
-
-                // If session was cleared externally without setting pendingDecision, deny
-                if (activeSession?.nonce != session.nonce) {
                     pendingDecision = null
-                    return false
-                }
-
-                val remaining = session.expiresAtMs - clock()
-                if (remaining <= 0L) {
-                    activeSession = null
-                    pendingDecision = null
-                    return false
-                }
-
-                if (waitStep != null) {
-                    waitStep(remaining)
-                } else {
-                    lock.wait(remaining)
+                    lock.notifyAll()
                 }
             }
         }

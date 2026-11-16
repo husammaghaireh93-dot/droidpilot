@@ -391,12 +391,18 @@ class MobileAccessibilityService : AccessibilityService() {
             return CommandResponse.error(null, "No active window after consent")
         }
         val postPackage = postRoot.packageName?.toString()
+        val postRootRefreshed = postRoot.refresh()
         postRoot.recycle()
 
-        val postDecision = policyEngine.evaluate("type_text", postPackage)
-        if (postDecision.type == PolicyDecisionType.DENY) {
-            auditLogger.record("type_text", postPackage ?: "none", "focused_input", "approved", "denied: ${postDecision.reason}")
-            return CommandResponse.error(null, postDecision.reason)
+        val windowCheck = policyEngine.verifyPostConsentContext(
+            consentedPackage = currentPackage,
+            currentPackage = postPackage,
+            targetPackage = postPackage,
+            refreshed = postRootRefreshed
+        )
+        if (windowCheck.type == PolicyDecisionType.DENY) {
+            auditLogger.record("type_text", postPackage ?: "none", "focused_input", "approved", "denied: ${windowCheck.reason}")
+            return CommandResponse.error(null, windowCheck.reason)
         }
 
         val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: run {
@@ -406,10 +412,16 @@ class MobileAccessibilityService : AccessibilityService() {
 
         val refreshed = focused.refresh()
         val targetPackage = focused.packageName?.toString()
-        val targetCheck = policyEngine.verifyTargetNodePackage(targetPackage, refreshed)
-        if (targetCheck.type == PolicyDecisionType.DENY || focused.isPassword) {
+        val focusedIsPassword = focused.isPassword
+        val targetCheck = policyEngine.verifyPostConsentContext(
+            consentedPackage = currentPackage,
+            currentPackage = postPackage,
+            targetPackage = targetPackage,
+            refreshed = refreshed
+        )
+        if (targetCheck.type == PolicyDecisionType.DENY || focusedIsPassword) {
             focused.recycle()
-            val reason = if (focused.isPassword) "Typing into password fields is blocked" else targetCheck.reason
+            val reason = if (focusedIsPassword) "Typing into password fields is blocked" else targetCheck.reason
             auditLogger.record("type_text", targetPackage ?: postPackage!!, "focused_input", "approved", "denied: $reason")
             return CommandResponse.error(null, reason)
         }
@@ -578,11 +590,16 @@ class MobileAccessibilityService : AccessibilityService() {
             return CommandResponse.error(null, "No active window after consent")
         }
         val postPackage = postRoot.packageName?.toString()
-        val postDecision = policyEngine.evaluate("click_element", postPackage)
-        if (postDecision.type == PolicyDecisionType.DENY) {
+        val postRootCheck = policyEngine.verifyPostConsentContext(
+            consentedPackage = currentPackage,
+            currentPackage = postPackage,
+            targetPackage = postPackage,
+            refreshed = postRoot.refresh()
+        )
+        if (postRootCheck.type == PolicyDecisionType.DENY) {
             postRoot.recycle()
-            auditLogger.record("click_element", postPackage ?: "none", elemSummary, "approved", "denied: ${postDecision.reason}")
-            return CommandResponse.error(null, postDecision.reason)
+            auditLogger.record("click_element", postPackage ?: "none", elemSummary, "approved", "denied: ${postRootCheck.reason}")
+            return CommandResponse.error(null, postRootCheck.reason)
         }
 
         val node = findFirstElement(postRoot, text, id, null, contentDesc)
@@ -609,8 +626,18 @@ class MobileAccessibilityService : AccessibilityService() {
         val refreshed = target.refresh() && node.refresh()
         val targetPkg = target.packageName?.toString()
         val nodePkg = node.packageName?.toString()
-        val targetCheck = policyEngine.verifyTargetNodePackage(targetPkg, refreshed)
-        val nodeCheck = policyEngine.verifyTargetNodePackage(nodePkg, refreshed)
+        val targetCheck = policyEngine.verifyPostConsentContext(
+            consentedPackage = currentPackage,
+            currentPackage = postPackage,
+            targetPackage = targetPkg,
+            refreshed = refreshed
+        )
+        val nodeCheck = policyEngine.verifyPostConsentContext(
+            consentedPackage = currentPackage,
+            currentPackage = postPackage,
+            targetPackage = nodePkg,
+            refreshed = refreshed
+        )
         if (targetCheck.type == PolicyDecisionType.DENY || nodeCheck.type == PolicyDecisionType.DENY) {
             val reason = if (targetCheck.type == PolicyDecisionType.DENY) targetCheck.reason else nodeCheck.reason
             if (target != node) target.recycle()

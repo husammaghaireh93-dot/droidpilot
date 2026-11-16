@@ -33,11 +33,49 @@ class WebSocketCommandServer(
     private val connectedClients = mutableSetOf<WebSocket>()
 
     // Enforced: must be populated with a cryptographic secret before accepting connections
+    @Volatile
     var authToken: String = ""
 
+    private fun safeLogInfo(msg: String) {
+        try {
+            Log.i(TAG, msg)
+        } catch (_: Throwable) {
+            // Pure-JVM unit tests run without Android Log implementation
+        }
+    }
+
+    private fun safeLogError(msg: String, ex: Throwable) {
+        try {
+            Log.e(TAG, msg, ex)
+        } catch (_: Throwable) {
+            // Pure-JVM unit tests run without Android Log implementation
+        }
+    }
+
+    /**
+     * Rotates the active Bearer token and immediately disconnects all existing
+     * WebSocket sessions so stale clients cannot continue sending commands.
+     */
+    fun rotateAuthToken(newToken: String) {
+        authToken = newToken
+        val toClose = synchronized(connectedClients) {
+            val snapshot = connectedClients.toList()
+            connectedClients.clear()
+            snapshot
+        }
+        for (client in toClose) {
+            try {
+                client.close(4001, "Unauthorized: Auth token rotated")
+            } catch (_: Exception) {}
+        }
+        onConnectionChange(0)
+        onLog("Auth token rotated; closed ${toClose.size} active connection(s)")
+    }
+
     fun isAuthorizedHandshake(authorizationHeader: String?): Boolean {
-        if (authToken.isEmpty() || authorizationHeader.isNullOrBlank()) return false
-        val expected = "Bearer $authToken".toByteArray(Charsets.UTF_8)
+        val currentToken = authToken
+        if (currentToken.isEmpty() || authorizationHeader.isNullOrBlank()) return false
+        val expected = "Bearer $currentToken".toByteArray(Charsets.UTF_8)
         val provided = authorizationHeader.toByteArray(Charsets.UTF_8)
         return MessageDigest.isEqual(expected, provided)
     }
@@ -45,7 +83,7 @@ class WebSocketCommandServer(
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
         val remoteSocket = conn.remoteSocketAddress
         val remoteAddr = remoteSocket?.toString() ?: "unknown"
-        Log.i(TAG, "Client connecting: $remoteAddr")
+        safeLogInfo("Client connecting: $remoteAddr")
 
         if (!isLoopbackRemote(remoteSocket?.address)) {
             conn.close(4003, "Forbidden: Loopback connections only")
@@ -69,12 +107,13 @@ class WebSocketCommandServer(
 
     override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
         val remoteAddr = conn.remoteSocketAddress?.toString() ?: "unknown"
-        Log.i(TAG, "Client disconnected: $remoteAddr")
+        safeLogInfo("Client disconnected: $remoteAddr")
         onLog("Client disconnected: $remoteAddr")
-        synchronized(connectedClients) {
+        val remaining = synchronized(connectedClients) {
             connectedClients.remove(conn)
+            connectedClients.size
         }
-        onConnectionChange(connectedClients.size)
+        onConnectionChange(remaining)
     }
 
     override fun onMessage(conn: WebSocket, message: String) {
@@ -104,19 +143,19 @@ class WebSocketCommandServer(
             } catch (e: JsonSyntaxException) {
                 sendError(conn, null, "Invalid JSON: ${e.message}")
             } catch (e: Exception) {
-                Log.e(TAG, "Error processing message", e)
+                safeLogError("Error processing message", e)
                 sendError(conn, null, "Internal error: ${e.message}")
             }
         }
     }
 
     override fun onError(conn: WebSocket?, ex: Exception) {
-        Log.e(TAG, "WebSocket error", ex)
+        safeLogError("WebSocket error", ex)
         onLog("Error: ${ex.message}")
     }
 
     override fun onStart() {
-        Log.i(TAG, "WebSocket server started on 127.0.0.1:${this.port}")
+        safeLogInfo("WebSocket server started on 127.0.0.1:${this.port}")
         onLog("Server started on 127.0.0.1:${this.port}")
         connectionLostTimeout = 60
     }
@@ -134,7 +173,7 @@ class WebSocketCommandServer(
             executor.shutdownNow()
             stop(1000)
         } catch (e: Exception) {
-            Log.e(TAG, "Error shutting down", e)
+            safeLogError("Error shutting down", e)
         }
     }
 }

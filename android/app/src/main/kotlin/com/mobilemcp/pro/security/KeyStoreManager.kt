@@ -69,6 +69,11 @@ class KeyStoreManager(context: Context) {
             }
         }
 
+        return rotateAuthToken()
+    }
+
+    @Synchronized
+    fun rotateAuthToken(): String {
         val randomBytes = ByteArray(32)
         SecureRandom().nextBytes(randomBytes)
         val newToken = randomBytes.joinToString("") { "%02x".format(it) }
